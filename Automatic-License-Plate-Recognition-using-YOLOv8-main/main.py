@@ -1,69 +1,50 @@
 from ultralytics import YOLO
 import cv2
+import requests
+from util import read_license_plate # Ensure util.py is in your folder
 
-import util
-from sort.sort import *
-from util import get_car, read_license_plate, write_csv
-
-
-results = {}
-
-mot_tracker = Sort()
-
-# load models
-coco_model = YOLO('yolov8n.pt')
 license_plate_detector = YOLO('license_plate_detector.pt')
-
-# load video
 cap = cv2.VideoCapture('./sample.mp4')
 
-vehicles = [2, 3, 5, 7]
+seen_plates = set()
+frame_count = 0
 
-# read frames
-frame_nmr = -1
-ret = True
-while ret:
-    frame_nmr += 1
+while cap.isOpened():
     ret, frame = cap.read()
-    if ret:
-        results[frame_nmr] = {}
-        # detect vehicles
-        detections = coco_model(frame)[0]
-        detections_ = []
-        for detection in detections.boxes.data.tolist():
-            x1, y1, x2, y2, score, class_id = detection
-            if int(class_id) in vehicles:
-                detections_.append([x1, y1, x2, y2, score])
+    if not ret: break
 
-        # track vehicles
-        track_ids = mot_tracker.update(np.asarray(detections_))
+    frame_count += 1
+    if frame_count % 5 != 0: continue # Process every 5th frame for speed
 
-        # detect license plates
-        license_plates = license_plate_detector(frame)[0]
-        for license_plate in license_plates.boxes.data.tolist():
-            x1, y1, x2, y2, score, class_id = license_plate
+    img = cv2.resize(frame, (640, 360))
+    results = license_plate_detector(img)[0]
 
-            # assign license plate to car
-            xcar1, ycar1, xcar2, ycar2, car_id = get_car(license_plate, track_ids)
+    for plate in results.boxes.data.tolist():
+        x1, y1, x2, y2, score, _ = plate
+        if score < 0.5: continue
 
-            if car_id != -1:
+        crop = img[int(y1):int(y2), int(x1):int(x2)]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 64, 255, cv2.THRESH_BINARY_INV)
 
-                # crop license plate
-                license_plate_crop = frame[int(y1):int(y2), int(x1): int(x2), :]
+        text, conf = read_license_plate(thresh)
 
-                # process license plate
-                license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
-                _, license_plate_crop_thresh = cv2.threshold(license_plate_crop_gray, 64, 255, cv2.THRESH_BINARY_INV)
+        if text and conf > 0.6 and text not in seen_plates:
+            seen_plates.add(text)
+            
+            # Default risk logic
+            risk = 15 if text.startswith("HU") else 85
+            
+            try:
+                requests.post("http://localhost:8000/scan", 
+                              json={"plate": text, "risk": risk}, 
+                              timeout=0.5)
+                print(f"Sent: {text}")
+            except:
+                print("Server offline")
 
-                # read license plate number
-                license_plate_text, license_plate_text_score = read_license_plate(license_plate_crop_thresh)
+    cv2.imshow("Gate Vision", img)
+    if cv2.waitKey(1) & 0xFF == 27: break
 
-                if license_plate_text is not None:
-                    results[frame_nmr][car_id] = {'car': {'bbox': [xcar1, ycar1, xcar2, ycar2]},
-                                                  'license_plate': {'bbox': [x1, y1, x2, y2],
-                                                                    'text': license_plate_text,
-                                                                    'bbox_score': score,
-                                                                    'text_score': license_plate_text_score}}
-
-# write results
-write_csv(results, './test.csv')
+cap.release()
+cv2.destroyAllWindows()
